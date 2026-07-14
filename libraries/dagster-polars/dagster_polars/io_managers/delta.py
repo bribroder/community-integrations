@@ -9,9 +9,7 @@ from dagster import (
     InputContext,
     MetadataValue,
     MultiPartitionKey,
-    MultiPartitionsDefinition,
     OutputContext,
-    TimeWindowPartitionsDefinition,
 )
 from dagster._core.errors import DagsterInvariantViolationError
 from dagster._core.storage.upath_io_manager import is_dict_type
@@ -273,7 +271,9 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
 
                 if use_legacy_deltalake:
                     if engine == "rust":
-                        delta_write_options["predicate"] = self.get_predicate(context)
+                        delta_write_options["predicate"] = self.get_predicate(
+                            context, df
+                        )
 
                     elif engine == "pyarrow":
                         delta_write_options["partition_filters"] = (
@@ -283,7 +283,7 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
                     else:
                         raise NotImplementedError(f"Invalid engine: {engine}")
                 else:
-                    delta_write_options["predicate"] = self.get_predicate(context)
+                    delta_write_options["predicate"] = self.get_predicate(context, df)
 
         if delta_write_options:
             context.log.debug(
@@ -472,10 +472,18 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
     @staticmethod
     def get_predicate(
         context: InputContext | OutputContext,
+        df: pl.DataFrame | None = None,
     ) -> str | None:
         """Create a predicate for `deltalake` to select which partitions are overwritten.
 
         Returns `None` if the entire table is overwritten.
+
+        Partition keys are quoted as string literals by default. When the target
+        column in the written DataFrame is a `Date` type, the key is emitted as a
+        `DATE '...'` literal so the predicate compares against the native column
+        type. The column dtype is used as the signal rather than the
+        `PartitionsDefinition` type, since a `TimeWindowPartitionsDefinition` may
+        map onto a non-temporal column (e.g. a string `year` derived from `%Y`).
 
         See documentation here:
         https://delta-io.github.io/delta-rs/usage/writing/#overwriting-part-of-the-table-data-using-a-predicate
@@ -491,17 +499,10 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
                 f"Invalid context type: {type(context)}"
             )
 
-        def key_to_predicate(key: str, dim: str | None = None) -> str:
-            partitions_def = context.asset_partitions_def
-            if dim is not None and isinstance(
-                partitions_def, MultiPartitionsDefinition
-            ):
-                dim_partitions_def = partitions_def.get_partitions_def_for_dimension(
-                    dim
-                )
-                if isinstance(dim_partitions_def, TimeWindowPartitionsDefinition):
-                    return f"DATE '{key}'"
-            elif isinstance(partitions_def, TimeWindowPartitionsDefinition):
+        schema = df.schema if df is not None else None
+
+        def key_to_predicate(key: str, column: str) -> str:
+            if schema is not None and schema.get(column) == pl.Date:
                 return f"DATE '{key}'"
             return f"'{key}'"
 
@@ -520,7 +521,7 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
 
             predicate = " AND ".join(
                 [
-                    f"{partition_by[dim]} in ({', '.join(key_to_predicate(key, dim) for key in keys)})"
+                    f"{partition_by[dim]} in ({', '.join(key_to_predicate(key, partition_by[dim]) for key in keys)})"
                     for dim, keys in all_keys_by_dim.items()
                 ]
             )
@@ -532,9 +533,13 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
             )
 
             if len(context.asset_partition_keys) == 1:
-                predicate = f"{partition_by} = {key_to_predicate(context.asset_partition_keys[0])}"
+                predicate = f"{partition_by} = {key_to_predicate(context.asset_partition_keys[0], partition_by)}"
             else:
-                predicate = f"{partition_by} in ({', '.join(map(key_to_predicate, context.asset_partition_keys))})"
+                keys = ", ".join(
+                    key_to_predicate(key, partition_by)
+                    for key in context.asset_partition_keys
+                )
+                predicate = f"{partition_by} in ({keys})"
 
         else:
             raise NotImplementedError(

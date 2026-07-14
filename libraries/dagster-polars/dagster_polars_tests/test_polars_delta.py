@@ -17,6 +17,7 @@ from dagster import (
     OutputContext,
     RunConfig,
     StaticPartitionsDefinition,
+    TimeWindowPartitionsDefinition,
     asset,
     materialize,
 )
@@ -339,6 +340,52 @@ def test_polars_delta_native_partitioning(
     )
 
 
+def test_polars_delta_native_partitioning_time_window_string_column(
+    polars_delta_io_manager: PolarsDeltaIOManager,
+    df_for_delta: pl.DataFrame,
+):
+    """Regression test for #330.
+
+    A ``TimeWindowPartitionsDefinition`` (yearly) whose key is stored in a
+    string column must produce a string predicate (``year = '2025'``) rather
+    than a ``DATE '2025'`` literal, which fails with ``Cannot cast string
+    '2025' to value of Date32 type``.
+    """
+    manager = polars_delta_io_manager
+    df = df_for_delta
+
+    partitions_def = TimeWindowPartitionsDefinition(
+        start="2024",
+        fmt="%Y",
+        cron_schedule="@yearly",
+        end_offset=1,
+    )
+
+    @asset(
+        io_manager_def=manager,
+        partitions_def=partitions_def,
+        metadata={"partition_by": "year"},
+    )
+    def upstream_partitioned(context: OpExecutionContext) -> pl.DataFrame:
+        return df.with_columns(pl.lit(context.partition_key).alias("year"))
+
+    @asset(io_manager_def=manager, partitions_def=partitions_def)
+    def downstream_partitioned(
+        context: AssetExecutionContext, upstream_partitioned: pl.DataFrame
+    ) -> None:
+        years = upstream_partitioned["year"].unique().to_list()
+        assert years == [context.partition_key]
+
+    for partition_key in ["2024", "2025"]:
+        result = materialize(
+            [upstream_partitioned, downstream_partitioned],
+            partition_key=partition_key,
+        )
+        saved_path = get_saved_path(result, "upstream_partitioned")
+        assert saved_path.endswith("upstream_partitioned.delta"), saved_path
+        assert DeltaTable(saved_path).metadata().partition_columns == ["year"]
+
+
 def test_polars_delta_native_multi_partitions(
     polars_delta_io_manager: PolarsDeltaIOManager,
     df_for_delta: pl.DataFrame,
@@ -494,28 +541,51 @@ def test_polars_delta_io_manager_schema_mode_set(dagster_instance: DagsterInstan
 
 
 @pytest.mark.parametrize(
-    "partition_by, partition_keys, expected_filters, expected_predicate",
+    "partition_by, partition_keys, expected_filters, expected_predicate, df",
     [
-        ("col_name", ["a"], [("col_name", "in", ["a"])], "col_name = 'a'"),
+        ("col_name", ["a"], [("col_name", "in", ["a"])], "col_name = 'a'", None),
         (
             "col_name",
             ["a", "b"],
             [("col_name", "in", ["a", "b"])],
             "col_name in ('a', 'b')",
+            None,
         ),
         (
             {"col_name": "mapped_col"},
             [{"col_name": "a"}],
             [("mapped_col", "in", ["a"])],
             "mapped_col in ('a')",
+            None,
         ),
         (
             {"col_name": "mapped_col"},
             [{"col_name": "a"}, {"col_name": "b"}],
             [("mapped_col", "in", ["a", "b"])],
             "mapped_col in ('a', 'b')",
+            None,
         ),
-        (None, [], [], None),
+        (None, [], [], None, None),
+        # Regression (#330): a time-window partition mapped onto a non-temporal
+        # (string) column must stay quoted as a string, not wrapped in `DATE`.
+        (
+            "year",
+            ["2025"],
+            [("year", "in", ["2025"])],
+            "year = '2025'",
+            pl.DataFrame({"year": ["2025"]}, schema={"year": pl.String}),
+        ),
+        # A genuine `Date` column is emitted as a `DATE '...'` literal so the
+        # predicate compares against the native column type.
+        (
+            "date",
+            ["2025-01-01"],
+            [("date", "in", ["2025-01-01"])],
+            "date = DATE '2025-01-01'",
+            pl.DataFrame(
+                {"date": [datetime(2025, 1, 1).date()]}, schema={"date": pl.Date}
+            ),
+        ),
     ],
 )
 @pytest.mark.parametrize("context", [InputContext, OutputContext])
@@ -525,6 +595,7 @@ def test_partition_filters_predicate(
     partition_keys: list[str] | list[dict[str, str]],
     expected_filters: list[tuple[str, str, list[str]]],
     expected_predicate: str,
+    df: pl.DataFrame | None,
     context: type[InputContext | OutputContext],
 ):
     """Test that the partition filters and predicate are generated correctly."""
@@ -562,4 +633,4 @@ def test_partition_filters_predicate(
         )
 
     assert PolarsDeltaIOManager.get_partition_filters(context) == expected_filters
-    assert PolarsDeltaIOManager.get_predicate(context) == expected_predicate
+    assert PolarsDeltaIOManager.get_predicate(context, df) == expected_predicate
