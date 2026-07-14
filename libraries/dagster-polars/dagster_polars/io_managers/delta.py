@@ -271,9 +271,7 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
 
                 if use_legacy_deltalake:
                     if engine == "rust":
-                        delta_write_options["predicate"] = self.get_predicate(
-                            context, df
-                        )
+                        delta_write_options["predicate"] = self.get_predicate(context)
 
                     elif engine == "pyarrow":
                         delta_write_options["partition_filters"] = (
@@ -283,7 +281,7 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
                     else:
                         raise NotImplementedError(f"Invalid engine: {engine}")
                 else:
-                    delta_write_options["predicate"] = self.get_predicate(context, df)
+                    delta_write_options["predicate"] = self.get_predicate(context)
 
         if delta_write_options:
             context.log.debug(
@@ -472,18 +470,19 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
     @staticmethod
     def get_predicate(
         context: InputContext | OutputContext,
-        df: pl.DataFrame | None = None,
     ) -> str | None:
         """Create a predicate for `deltalake` to select which partitions are overwritten.
 
         Returns `None` if the entire table is overwritten.
 
-        Partition keys are quoted as string literals by default. When the target
-        column in the written DataFrame is a `Date` type, the key is emitted as a
-        `DATE '...'` literal so the predicate compares against the native column
-        type. The column dtype is used as the signal rather than the
-        `PartitionsDefinition` type, since a `TimeWindowPartitionsDefinition` may
-        map onto a non-temporal column (e.g. a string `year` derived from `%Y`).
+        Partition keys are always compared with `=` (multiple keys are joined
+        with `OR`) using plain string literals. This works across column types
+        (string, `Date`, `Datetime`, integer, ...) because `deltalake`'s
+        DataFusion predicate parser implicitly coerces the string literal to the
+        column's type for `=`. The `IN (...)` operator is deliberately avoided:
+        it requires the literal type to match the column type exactly, so a
+        string literal fails against a `Date`/`Datetime` column, and there is no
+        literal form that both parses and matches for temporal columns (see #330).
 
         See documentation here:
         https://delta-io.github.io/delta-rs/usage/writing/#overwriting-part-of-the-table-data-using-a-predicate
@@ -499,12 +498,8 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
                 f"Invalid context type: {type(context)}"
             )
 
-        schema = df.schema if df is not None else None
-
-        def key_to_predicate(key: str, column: str) -> str:
-            if schema is not None and schema.get(column) == pl.Date:
-                return f"DATE '{key}'"
-            return f"'{key}'"
+        def keys_to_predicate(column: str, keys: list[str]) -> str:
+            return " OR ".join(f"{column} = '{key}'" for key in keys)
 
         if partition_by is None or not context.has_asset_partitions:
             return
@@ -520,10 +515,8 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
                     all_keys_by_dim[dim].append(key)
 
             predicate = " AND ".join(
-                [
-                    f"{partition_by[dim]} in ({', '.join(key_to_predicate(key, partition_by[dim]) for key in keys)})"
-                    for dim, keys in all_keys_by_dim.items()
-                ]
+                f"({keys_to_predicate(partition_by[dim], keys)})"
+                for dim, keys in all_keys_by_dim.items()
             )
 
         elif isinstance(partition_by, str):
@@ -531,15 +524,9 @@ class PolarsDeltaIOManager(BasePolarsUPathIOManager):
                 f"Received string `partition_by` metadata value `{partition_by}`, "
                 f"but the partition_key is not a `MultiPartitionKey`: {context.asset_partition_keys[0]}"
             )
-
-            if len(context.asset_partition_keys) == 1:
-                predicate = f"{partition_by} = {key_to_predicate(context.asset_partition_keys[0], partition_by)}"
-            else:
-                keys = ", ".join(
-                    key_to_predicate(key, partition_by)
-                    for key in context.asset_partition_keys
-                )
-                predicate = f"{partition_by} in ({keys})"
+            predicate = keys_to_predicate(
+                partition_by, list(context.asset_partition_keys)
+            )
 
         else:
             raise NotImplementedError(

@@ -386,6 +386,54 @@ def test_polars_delta_native_partitioning_time_window_string_column(
         assert DeltaTable(saved_path).metadata().partition_columns == ["year"]
 
 
+def test_polars_delta_native_partitioning_datetime_column_predicate(
+    polars_delta_io_manager: PolarsDeltaIOManager,
+    df_for_delta: pl.DataFrame,
+):
+    """The overwrite predicate must work for a ``Datetime`` partition column.
+
+    In ``0.27.12`` the predicate emitted a ``DATE '...'`` literal, which fails
+    to compare against a ``Datetime`` column (`Invalid comparison operation:
+    Timestamp <= ...`). A plain string literal is coerced by DataFusion to the
+    column's timestamp type, so overwriting one partition leaves the others
+    intact.
+
+    Note: this exercises the write/overwrite predicate path only. Reading back a
+    *single* partition of a ``Datetime``-partitioned table is a separate,
+    pre-existing delta-rs limitation (the partition value cannot be parsed as
+    ``timestamp_ntz``), so the table is read back in full here rather than via a
+    partitioned downstream asset.
+    """
+    manager = polars_delta_io_manager
+    df = df_for_delta
+
+    partitions_def = DailyPartitionsDefinition(start_date=datetime(2024, 1, 1))
+
+    @asset(
+        io_manager_def=manager,
+        partitions_def=partitions_def,
+        metadata={"partition_by": "ts"},
+    )
+    def upstream_partitioned(context: OpExecutionContext) -> pl.DataFrame:
+        return df.with_columns(
+            pl.lit(context.partition_key)
+            .str.strptime(pl.Datetime, "%Y-%m-%d")
+            .alias("ts")
+        )
+
+    saved_path = None
+    for partition_key in ["2024-01-01", "2024-01-02"]:
+        result = materialize([upstream_partitioned], partition_key=partition_key)
+        saved_path = get_saved_path(result, "upstream_partitioned")
+
+    assert saved_path is not None
+    assert DeltaTable(saved_path).metadata().partition_columns == ["ts"]
+
+    # Both partition writes succeeded and neither predicate clobbered the other.
+    written = pl.read_delta(saved_path)["ts"].unique().sort().to_list()
+    assert written == [datetime(2024, 1, 1), datetime(2024, 1, 2)]
+
+
 def test_polars_delta_native_multi_partitions(
     polars_delta_io_manager: PolarsDeltaIOManager,
     df_for_delta: pl.DataFrame,
@@ -541,51 +589,28 @@ def test_polars_delta_io_manager_schema_mode_set(dagster_instance: DagsterInstan
 
 
 @pytest.mark.parametrize(
-    "partition_by, partition_keys, expected_filters, expected_predicate, df",
+    "partition_by, partition_keys, expected_filters, expected_predicate",
     [
-        ("col_name", ["a"], [("col_name", "in", ["a"])], "col_name = 'a'", None),
+        ("col_name", ["a"], [("col_name", "in", ["a"])], "col_name = 'a'"),
         (
             "col_name",
             ["a", "b"],
             [("col_name", "in", ["a", "b"])],
-            "col_name in ('a', 'b')",
-            None,
+            "col_name = 'a' OR col_name = 'b'",
         ),
         (
             {"col_name": "mapped_col"},
             [{"col_name": "a"}],
             [("mapped_col", "in", ["a"])],
-            "mapped_col in ('a')",
-            None,
+            "(mapped_col = 'a')",
         ),
         (
             {"col_name": "mapped_col"},
             [{"col_name": "a"}, {"col_name": "b"}],
             [("mapped_col", "in", ["a", "b"])],
-            "mapped_col in ('a', 'b')",
-            None,
+            "(mapped_col = 'a' OR mapped_col = 'b')",
         ),
-        (None, [], [], None, None),
-        # Regression (#330): a time-window partition mapped onto a non-temporal
-        # (string) column must stay quoted as a string, not wrapped in `DATE`.
-        (
-            "year",
-            ["2025"],
-            [("year", "in", ["2025"])],
-            "year = '2025'",
-            pl.DataFrame({"year": ["2025"]}, schema={"year": pl.String}),
-        ),
-        # A genuine `Date` column is emitted as a `DATE '...'` literal so the
-        # predicate compares against the native column type.
-        (
-            "date",
-            ["2025-01-01"],
-            [("date", "in", ["2025-01-01"])],
-            "date = DATE '2025-01-01'",
-            pl.DataFrame(
-                {"date": [datetime(2025, 1, 1).date()]}, schema={"date": pl.Date}
-            ),
-        ),
+        (None, [], [], None),
     ],
 )
 @pytest.mark.parametrize("context", [InputContext, OutputContext])
@@ -595,7 +620,6 @@ def test_partition_filters_predicate(
     partition_keys: list[str] | list[dict[str, str]],
     expected_filters: list[tuple[str, str, list[str]]],
     expected_predicate: str,
-    df: pl.DataFrame | None,
     context: type[InputContext | OutputContext],
 ):
     """Test that the partition filters and predicate are generated correctly."""
@@ -633,4 +657,4 @@ def test_partition_filters_predicate(
         )
 
     assert PolarsDeltaIOManager.get_partition_filters(context) == expected_filters
-    assert PolarsDeltaIOManager.get_predicate(context, df) == expected_predicate
+    assert PolarsDeltaIOManager.get_predicate(context) == expected_predicate
