@@ -16,7 +16,7 @@ def diff_to_transformation(
     end: dt.datetime
 ) -> transforms.Transform:
     """Based on the interval between two dates, return a transformation"""
-    
+
     start_ = pendulum.instance(start)
     end_ = pendulum.instance(end)
 
